@@ -5,9 +5,9 @@
 # https://alestic.com/2010/12/ec2-user-data-output/
 exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 
-# NAT packet forwarding / masquerade is provided by the AMI
-# (debian-nat-instance systemd unit). This script only does AWS-side setup:
-# source/dest check, EIP association, and private route table wiring.
+# Debian 13 (ak-debian-13-base) port of Alternat userdata:
+# https://github.com/chime/terraform-aws-alternat/blob/main/scripts/alternat.sh
+# Uses nftables + cloud_detect_lib from debian-13-base.
 
 panic() {
   [ -n "$1" ] && echo "$1"
@@ -34,6 +34,68 @@ validate_var() {
       echo "Config var \"$var_name\" is unset"
       exit 1
    fi
+}
+
+# configure_nat() sets up Linux to act as a NAT device.
+# See https://docs.aws.amazon.com/vpc/latest/userguide/VPC_NAT_Instance.html#NATInstance
+configure_nat() {
+   echo "Installing NAT dependencies if needed"
+   export DEBIAN_FRONTEND=noninteractive
+   apt-get update -qq
+   apt-get install -y -qq nftables procps || panic "Unable to install nftables"
+   if ! command -v aws >/dev/null 2>&1; then
+      apt-get install -y -qq awscli || panic "Unable to install awscli"
+   fi
+   command -v aws >/dev/null 2>&1 || panic "aws CLI not found on PATH"
+
+   systemctl enable --now nftables || panic "Unable to enable nftables"
+
+   local nic_mac
+   nic_mac="$(get_imds mac)" || panic "Unable to determine primary ENI MAC from IMDS."
+   echo "Found MAC ${nic_mac}"
+
+   local nic_name
+   nic_name="$(ip -o link | awk -v mac="${nic_mac}" 'BEGIN{IGNORECASE=1} index($0, mac){gsub(/:/,"",$2); print $2; exit}')"
+   if [ -z "${nic_name}" ]; then
+      nic_name="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+   fi
+   [ -n "${nic_name}" ] || panic "Unable to resolve NAT interface name"
+   echo "Found interface name ${nic_name}"
+
+   local vpc_cidr_uri="network/interfaces/macs/${nic_mac}/vpc-ipv4-cidr-blocks"
+   echo "Metadata location for vpc ipv4 ranges: ${vpc_cidr_uri}"
+
+   local vpc_cidrs=()
+   mapfile -t vpc_cidrs < <(get_imds "${vpc_cidr_uri}")
+   if [ ${#vpc_cidrs[@]} -lt 1 ] || [ -z "${vpc_cidrs[0]:-}" ]; then
+      panic "Unable to obtain VPC CIDR range from metadata."
+   fi
+   echo "Retrieved VPC CIDR range(s) ${vpc_cidrs[*]} from metadata."
+
+   echo "Enabling NAT..."
+   # Read more about these settings here: https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt
+   sysctl -q -w "net.ipv4.ip_forward"=1 \
+      "net.ipv4.conf.${nic_name}.send_redirects"=0 \
+      "net.ipv4.ip_local_port_range"="1024 65535" || panic "sysctl NAT settings failed"
+
+   # Idempotent: flush any previous alterNAT nat table, then recreate.
+   nft delete table ip nat 2>/dev/null || true
+   nft add table ip nat
+   nft add chain ip nat postrouting '{ type nat hook postrouting priority 100 ; }'
+
+   local cidr
+   for cidr in "${vpc_cidrs[@]}"; do
+      [ -n "$cidr" ] || continue
+      nft add rule ip nat postrouting ip saddr "$cidr" oif "$nic_name" masquerade
+      if [ $? -ne 0 ]; then
+         panic "Unable to add nft rule for cidr $cidr"
+      fi
+   done
+
+   sysctl "net.ipv4.ip_forward" "net.ipv4.conf.${nic_name}.send_redirects" "net.ipv4.ip_local_port_range"
+   nft list ruleset
+
+   echo "NAT configuration complete"
 }
 
 # Disabling source/dest check is what makes a NAT instance a NAT instance.
@@ -86,9 +148,8 @@ function associate_eip() {
    echo "Associated EIP $eip with instance $INSTANCE_ID"
 }
 
-# When enable_nat_restore=true: replace an existing default route, or create it if missing.
-# When enable_nat_restore=false: skip if 0.0.0.0/0 already exists; otherwise create it.
-# Manual failback (e.g. Lambda) owns intentional replace when restore is disabled.
+# When enable_nat_restore=true: replace then create (upstream Alternat).
+# When enable_nat_restore=false: skip if 0.0.0.0/0 already exists; otherwise create.
 configure_route_table() {
    echo "Configuring route tables (enable_nat_restore=${enable_nat_restore})"
 
@@ -150,7 +211,6 @@ complete_asg_lifecycle_action() {
     echo "No lifecycle action result given"
   fi
 
-  # IMDS instance tags (enabled on Alternat launch templates)
   local auto_scaling_group_name
   auto_scaling_group_name="$(get_imds_optional tags/instance/aws:autoscaling:groupName)"
   if [[ -z "${auto_scaling_group_name}" ]]; then
@@ -176,12 +236,27 @@ complete_asg_lifecycle_action() {
   echo "Completed ASG lifecycle action with result $1"
 }
 
-# debian-base ships this at /opt/scripts (IMDS token, REGION, AZ, …)
+# debian-13-base: /opt/scripts/cloud_detect_lib.sh
 # shellcheck source=/dev/null
 source /opt/scripts/cloud_detect_lib.sh
 # cloud_detect_lib enables set -euo pipefail; Alternat helpers rely on explicit $? checks.
 set +e
 set +u
+
+# Older AMI builds may lack helpers added later.
+if ! declare -F get_imds >/dev/null 2>&1; then
+  get_imds() {
+    curl $CURL_OPTS -H "$HEADER" "$URI/latest/meta-data/$1"
+  }
+fi
+if ! declare -F get_imds_optional >/dev/null 2>&1; then
+  get_imds_optional() {
+    curl $CURL_OPTS -H "$HEADER" "$URI/latest/meta-data/$1" 2>/dev/null || true
+  }
+fi
+if [ -z "${INSTANCE_ID:-}" ]; then
+  INSTANCE_ID="$(get_imds instance-id)"
+fi
 
 export AWS_DEFAULT_OUTPUT="text"
 # https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-pagination.html#cli-usage-pagination-clientside
@@ -193,7 +268,8 @@ echo "Running on instance ${INSTANCE_ID} az=${AZ} region=${REGION}"
 CONFIG_FILE="/etc/alternat.conf"
 load_config
 
-echo "Beginning alterNAT AWS-side configuration (NAT dataplane provided by AMI)"
+echo "Beginning self-managed NAT configuration (ak-debian-13-base / nftables)"
+configure_nat
 disable_source_dest_check
 associate_eip
 configure_route_table

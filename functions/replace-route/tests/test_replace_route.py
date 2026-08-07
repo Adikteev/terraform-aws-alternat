@@ -314,17 +314,17 @@ def test_are_any_routes_pointing_to_nat_gateway():
 def test_run_nat_instance_diagnostics(mock_sleep):
     from app import run_nat_instance_diagnostics
 
-    iptables_masquerade = "iptables_nat=-P PREROUTING ACCEPT\n-A POSTROUTING -o ens5 -j MASQUERADE"
-    iptables_no_masquerade = "iptables_nat=-P PREROUTING ACCEPT\n-P POSTROUTING ACCEPT"
-    good_iptables_output = f"ip_forward=1\n{iptables_masquerade}"
+    nft_masquerade = "nft_ruleset=table ip nat {\n\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t\tip saddr 10.0.0.0/8 oif \"ens5\" masquerade\n\t}\n}"
+    nft_no_masquerade = "nft_ruleset=table ip nat {\n\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t}\n}"
+    good_nft_output = f"ip_forward=1\n{nft_masquerade}"
 
     # Test scenarios: (description, ssm_output, source_dest_check, expected_result)
     test_cases = [
-        ("successful diagnostics iptables", good_iptables_output, False, True),
-        ("ip_forward=0 failure", f"ip_forward=0\n{iptables_masquerade}", False, False),
-        ("missing masquerade rule failure", f"ip_forward=1\n{iptables_no_masquerade}", False, False),
-        ("source/dest check enabled failure", good_iptables_output, True, False),
-        ("error in source/dest check", good_iptables_output, None, False),
+        ("successful diagnostics nftables", good_nft_output, False, True),
+        ("ip_forward=0 failure", f"ip_forward=0\n{nft_masquerade}", False, False),
+        ("missing masquerade rule failure", f"ip_forward=1\n{nft_no_masquerade}", False, False),
+        ("source/dest check enabled failure", good_nft_output, True, False),
+        ("error in source/dest check", good_nft_output, None, False),
     ]
 
     with mock.patch('boto3.client') as mock_boto_client:
