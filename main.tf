@@ -118,7 +118,6 @@ resource "aws_autoscaling_group" "nat_instance" {
     for_each = merge(
       var.tags,
       { Name = "${var.nat_instance_name_prefix}${each.key}" },
-      data.aws_default_tags.current.tags,
     )
 
     content {
@@ -299,22 +298,34 @@ resource "aws_launch_template" "nat_instance_template" {
     security_groups             = [aws_security_group.nat_instance.id]
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name = "${var.nat_instance_name_prefix}${each.key}"
+  })
+
   tag_specifications {
     resource_type = "instance"
-
     tags = merge(var.tags, {
-      alterNATInstance = "true",
+      Name             = "${var.nat_instance_name_prefix}${each.key}"
+      alterNATInstance = "true"
     })
   }
 
   tag_specifications {
     resource_type = "volume"
-
     tags = merge(var.tags, {
-      alterNATInstance = "true",
+      Name             = "${var.nat_instance_name_prefix}${each.key}"
+      alterNATInstance = "true"
     })
   }
+
+  tag_specifications {
+    resource_type = "network-interface"
+    tags = merge(var.tags, {
+      Name             = "${var.nat_instance_name_prefix}${each.key}"
+      alterNATInstance = "true"
+    })
+  }
+
   user_data = data.cloudinit_config.config[each.key].rendered
 }
 
@@ -575,6 +586,5 @@ module "vpc_endpoints" {
   tags               = var.tags
 }
 
-data "aws_default_tags" "current" {}
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
