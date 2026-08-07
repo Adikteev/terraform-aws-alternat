@@ -201,7 +201,8 @@ data "cloudinit_config" "config" {
       eip_allocation_ids_csv  = join(",", local.nat_instance_eip_ids),
       route_table_ids_csv     = join(",", each.value),
       enable_ssm              = var.enable_ssm,
-      enable_cloudwatch_agent = var.enable_cloudwatch_agent
+      enable_cloudwatch_agent = var.enable_cloudwatch_agent,
+      enable_nat_restore      = var.enable_nat_restore
     })
   }
 

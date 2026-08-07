@@ -144,7 +144,7 @@ def replace_route(route_table_id, target_id):
 def run_nat_instance_diagnostics(instance_id):
     """
     Runs a basic diagnostic script via SSM on the NAT instance.
-    It checks if IP forwarding is enabled and lists the nftables NAT configuration.
+    Checks IP forwarding and an iptables MASQUERADE SNAT rule (Debian NAT AMI).
     Returns True if configuration is healthy, False otherwise.
     """
     ssm_client = boto3.client("ssm")
@@ -153,7 +153,7 @@ def run_nat_instance_diagnostics(instance_id):
         "#!/bin/bash",
         "set -e",
         "echo 'ip_forward='$(cat /proc/sys/net/ipv4/ip_forward)",
-        "echo 'nft_nat_table='$(nft list table ip nat 2>/dev/null || echo 'nftables nat table not found')"
+        "echo 'iptables_nat='$(iptables -t nat -S 2>/dev/null || echo 'iptables nat not found')",
     ]
 
     try:
@@ -177,13 +177,13 @@ def run_nat_instance_diagnostics(instance_id):
         if invocation.get('StandardErrorContent'):
             logger.warning("NAT instance diagnostic errors:\n%s", invocation['StandardErrorContent'])
 
-        # Check conditions
         if "ip_forward=0" in output:
             logger.warning("NAT instance has ip_forward=0 — IP forwarding is disabled.")
             return False
 
-        if "masquerade" not in output:
-            logger.warning("NAT instance nftables missing 'masquerade' rule — SNAT may be broken.")
+        # iptables -S prints "-j MASQUERADE"
+        if "masquerade" not in output.lower():
+            logger.warning("NAT instance iptables missing MASQUERADE rule — SNAT may be broken.")
             return False
 
         if is_source_dest_check_enabled(instance_id) is True:
