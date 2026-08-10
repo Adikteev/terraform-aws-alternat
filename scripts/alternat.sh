@@ -25,6 +25,7 @@ load_config() {
    validate_var "eip_allocation_ids_csv" "$eip_allocation_ids_csv"
    validate_var "route_table_ids_csv" "$route_table_ids_csv"
    validate_var "enable_nat_restore" "$enable_nat_restore"
+   validate_var "enable_ssm" "$enable_ssm"
 }
 
 validate_var() {
@@ -96,6 +97,45 @@ configure_nat() {
    nft list ruleset
 
    echo "NAT configuration complete"
+}
+
+# install_ssm_agent() installs amazon-ssm-agent from the official Debian package when enable_ssm=true.
+# https://docs.aws.amazon.com/systems-manager/latest/userguide/agent-install-deb.html
+install_ssm_agent() {
+   if [ "$enable_ssm" != "true" ]; then
+      echo "SSM agent install skipped (enable_ssm=${enable_ssm})"
+      return 0
+   fi
+
+   if systemctl is-active --quiet amazon-ssm-agent 2>/dev/null; then
+      echo "SSM agent already running"
+      return 0
+   fi
+
+   echo "Installing Amazon SSM agent"
+   export DEBIAN_FRONTEND=noninteractive
+
+   local arch deb_arch
+   arch="$(uname -m)"
+   case "$arch" in
+      aarch64|arm64) deb_arch="debian_arm64" ;;
+      x86_64|amd64) deb_arch="debian_amd64" ;;
+      *) panic "Unsupported architecture for SSM agent: ${arch}" ;;
+   esac
+
+   local tmp_deb="/tmp/amazon-ssm-agent.deb"
+   local regional_url="https://s3.${REGION}.amazonaws.com/amazon-ssm-${REGION}/latest/${deb_arch}/amazon-ssm-agent.deb"
+   local global_url="https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/${deb_arch}/amazon-ssm-agent.deb"
+
+   if ! curl -fsSL "$regional_url" -o "$tmp_deb"; then
+      echo "Regional SSM package download failed, trying global URL"
+      curl -fsSL "$global_url" -o "$tmp_deb" || panic "Unable to download amazon-ssm-agent.deb"
+   fi
+
+   dpkg -i "$tmp_deb" || apt-get install -y -qq -f || panic "Unable to install amazon-ssm-agent"
+   systemctl enable --now amazon-ssm-agent || panic "Unable to enable amazon-ssm-agent"
+   rm -f "$tmp_deb"
+   echo "SSM agent installed successfully"
 }
 
 # Disabling source/dest check is what makes a NAT instance a NAT instance.
@@ -270,6 +310,7 @@ load_config
 
 echo "Beginning self-managed NAT configuration (ak-debian-13-base / nftables)"
 configure_nat
+install_ssm_agent
 disable_source_dest_check
 associate_eip
 configure_route_table
