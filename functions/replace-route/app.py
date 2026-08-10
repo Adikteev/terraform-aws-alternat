@@ -298,9 +298,17 @@ def check_connection(check_urls):
         raise MissingEnvironmentVariableError("ROUTE_TABLE_IDS_CSV")
 
     restore_enabled = get_env_bool("ENABLE_NAT_RESTORE", DEFAULT_ENABLE_NAT_RESTORE)
+    already_on_nat_gateway = are_any_routes_pointing_to_nat_gateway(route_tables)
+
+    # Already failed over to NAT Gateway and automatic restore is disabled: success, nothing to do.
+    if not restore_enabled and already_on_nat_gateway:
+        logger.info(
+            "Already on NAT Gateway and ENABLE_NAT_RESTORE=false; skipping connectivity checks. Exiting successfully."
+        )
+        return True
 
     # Step 1: Try failback to NAT instance if allowed and current route is NAT Gateway
-    if restore_enabled and are_any_routes_pointing_to_nat_gateway(route_tables):
+    if restore_enabled and already_on_nat_gateway:
         logger.info("ENABLE_NAT_RESTORE=true and route is NAT Gateway. Trying to restore NAT instance...")
         attempt_nat_instance_restore()
         time.sleep(5)
@@ -358,6 +366,18 @@ def connectivity_test_handler(event, context):
         raise UnknownEventTypeError
 
     logger.debug("Starting NAT instance connectivity test")
+
+    route_tables = [rtb for rtb in os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",") if rtb]
+    restore_enabled = get_env_bool("ENABLE_NAT_RESTORE", DEFAULT_ENABLE_NAT_RESTORE)
+    if (
+        not restore_enabled
+        and route_tables
+        and are_any_routes_pointing_to_nat_gateway(route_tables)
+    ):
+        logger.info(
+            "Already on NAT Gateway and ENABLE_NAT_RESTORE=false; nothing to do. Exiting successfully."
+        )
+        return
 
     check_interval = int(os.getenv("CONNECTIVITY_CHECK_INTERVAL", DEFAULT_CONNECTIVITY_CHECK_INTERVAL))
     check_urls = "CHECK_URLS" in os.environ and os.getenv("CHECK_URLS").split(",") or DEFAULT_CHECK_URLS

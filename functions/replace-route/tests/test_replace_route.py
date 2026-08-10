@@ -236,6 +236,30 @@ def test_connectivity_test_handler(mock_urlopen, mock_sleep, monkeypatch):
     verify_nat_gateway_route(mocked_networking)
 
 
+@mock_aws
+@mock.patch('time.sleep')
+@mock.patch('urllib.request.urlopen')
+@mock.patch('app.are_any_routes_pointing_to_nat_gateway', return_value=True)
+def test_connectivity_test_handler_already_on_nat_gateway(mock_on_ngw, mock_urlopen, mock_sleep, monkeypatch):
+    from app import connectivity_test_handler
+
+    script_dir = os.path.dirname(__file__)
+    with open(os.path.join(script_dir, "../cloudwatch-event.json"), "r") as file:
+        cloudwatch_event = file.read()
+
+    class Context:
+        function_name = "alternat-connectivity-test"
+
+    monkeypatch.setenv("ROUTE_TABLE_IDS_CSV", "rtb-aaaaaaaa,rtb-bbbbbbbb")
+    monkeypatch.setenv("ENABLE_NAT_RESTORE", "false")
+
+    connectivity_test_handler(event=json.loads(cloudwatch_event), context=Context())
+
+    mock_on_ngw.assert_called_once()
+    mock_urlopen.assert_not_called()
+    mock_sleep.assert_not_called()
+
+
 def test_disable_ipv6():
     with mock.patch('socket.getaddrinfo') as mock_getaddrinfo:
         from app import disable_ipv6
