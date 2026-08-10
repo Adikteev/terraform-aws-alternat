@@ -51,25 +51,21 @@ configure_nat() {
 
    systemctl enable --now nftables || panic "Unable to enable nftables"
 
-   local nic_mac
-   nic_mac="$(get_imds mac)" || panic "Unable to determine primary ENI MAC from IMDS."
-   echo "Found MAC ${nic_mac}"
+   [ -n "${MAC:-}" ] || panic "MAC missing from cloud_detect_lib"
+   echo "Found MAC ${MAC}"
 
    local nic_name
-   nic_name="$(ip -o link | awk -v mac="${nic_mac}" 'BEGIN{IGNORECASE=1} index($0, mac){gsub(/:/,"",$2); print $2; exit}')"
+   nic_name="$(ip -o link | awk -v mac="${MAC}" 'BEGIN{IGNORECASE=1} index($0, mac){gsub(/:/,"",$2); print $2; exit}')"
    if [ -z "${nic_name}" ]; then
       nic_name="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
    fi
    [ -n "${nic_name}" ] || panic "Unable to resolve NAT interface name"
    echo "Found interface name ${nic_name}"
 
-   local vpc_cidr_uri="network/interfaces/macs/${nic_mac}/vpc-ipv4-cidr-blocks"
-   echo "Metadata location for vpc ipv4 ranges: ${vpc_cidr_uri}"
-
    local vpc_cidrs=()
-   mapfile -t vpc_cidrs < <(get_imds "${vpc_cidr_uri}")
+   mapfile -t vpc_cidrs <<< "${VPC_IPV4_CIDR_BLOCKS:-}"
    if [ ${#vpc_cidrs[@]} -lt 1 ] || [ -z "${vpc_cidrs[0]:-}" ]; then
-      panic "Unable to obtain VPC CIDR range from metadata."
+      panic "Unable to obtain VPC CIDR range from cloud_detect_lib (VPC_IPV4_CIDR_BLOCKS)."
    fi
    echo "Retrieved VPC CIDR range(s) ${vpc_cidrs[*]} from metadata."
 
@@ -251,16 +247,14 @@ complete_asg_lifecycle_action() {
     echo "No lifecycle action result given"
   fi
 
-  local auto_scaling_group_name
-  auto_scaling_group_name="$(get_imds_optional tags/instance/aws:autoscaling:groupName)"
-  if [[ -z "${auto_scaling_group_name}" ]]; then
-    echo "Could not detect auto scaling group name"
+  if [[ -z "${ASG_NAME:-}" ]]; then
+    echo "Could not detect auto scaling group name (ASG_NAME from cloud_detect_lib)"
   fi
 
   local output status
   output="$(aws autoscaling complete-lifecycle-action \
     --lifecycle-hook-name "${ASG_LIFECYCLE_HOOK_NAME}" \
-    --auto-scaling-group-name "${auto_scaling_group_name}" \
+    --auto-scaling-group-name "${ASG_NAME}" \
     --lifecycle-action-result "$1" \
     --instance-id "${INSTANCE_ID}" 2>&1)"
   status=$?
@@ -277,26 +271,14 @@ complete_asg_lifecycle_action() {
 }
 
 # debian-13-base: /opt/scripts/cloud_detect_lib.sh
+# Provides INSTANCE_ID, REGION, AZ, MAC, VPC_IPV4_CIDR_BLOCKS, ASG_NAME, ...
 # shellcheck source=/dev/null
 source /opt/scripts/cloud_detect_lib.sh
 # cloud_detect_lib enables set -euo pipefail; Alternat helpers rely on explicit $? checks.
 set +e
 set +u
 
-# Older AMI builds may lack helpers added later.
-if ! declare -F get_imds >/dev/null 2>&1; then
-  get_imds() {
-    curl $CURL_OPTS -H "$HEADER" "$URI/latest/meta-data/$1"
-  }
-fi
-if ! declare -F get_imds_optional >/dev/null 2>&1; then
-  get_imds_optional() {
-    curl $CURL_OPTS -H "$HEADER" "$URI/latest/meta-data/$1" 2>/dev/null || true
-  }
-fi
-if [ -z "${INSTANCE_ID:-}" ]; then
-  INSTANCE_ID="$(get_imds instance-id)"
-fi
+[ -n "${INSTANCE_ID:-}" ] || panic "INSTANCE_ID missing from cloud_detect_lib"
 
 export AWS_DEFAULT_OUTPUT="text"
 # https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-pagination.html#cli-usage-pagination-clientside
