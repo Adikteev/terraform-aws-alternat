@@ -91,6 +91,12 @@ variable "ingress_security_group_cidr_blocks" {
   default     = []
 }
 
+variable "vpn_cidr_blocks" {
+  description = "CIDR blocks for VPN ingress to the NAT instance security group (all protocols)."
+  type        = list(string)
+  default     = []
+}
+
 variable "ingress_security_group_ipv6_cidr_blocks" {
   description = "A list of IPv6 CIDR blocks that are allowed by the NAT instance."
   type        = list(string)

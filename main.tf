@@ -367,6 +367,18 @@ resource "aws_security_group_rule" "nat_instance_ip_range_ingress" {
   cidr_blocks       = var.ingress_security_group_cidr_blocks
 }
 
+resource "aws_security_group_rule" "nat_instance_vpn_ingress" {
+  count = length(var.vpn_cidr_blocks) > 0 ? 1 : 0
+
+  description       = "Adikteev VPN"
+  type              = "ingress"
+  protocol          = "-1"
+  from_port         = 0
+  to_port           = 0
+  security_group_id = aws_security_group.nat_instance.id
+  cidr_blocks       = var.vpn_cidr_blocks
+}
+
 resource "aws_security_group_rule" "nat_instance_ipv6_range_ingress" {
   count = length(var.ingress_security_group_ipv6_cidr_blocks) > 0 ? 1 : 0
 
