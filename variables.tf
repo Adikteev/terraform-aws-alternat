@@ -146,7 +146,7 @@ variable "nat_instance_lifecycle_hook_role_name" {
 }
 
 variable "nat_instance_name_prefix" {
-  description = "Prefix for the NAT Auto Scaling Group and instance names. Because there is an instance created in each ASG, the name will be suffixed with an index."
+  description = "Prefix for the NAT Auto Scaling Group and instance names. ASG names become <prefix><az>-<random> (e.g. alternat-ap-southeast-1a-xxxxxx)."
   type        = string
   default     = "alternat-"
 }

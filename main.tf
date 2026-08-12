@@ -88,7 +88,7 @@ resource "aws_sns_topic" "alternat_topic" {
 resource "aws_autoscaling_group" "nat_instance" {
   for_each = { for obj in var.vpc_az_maps : obj.az => obj.public_subnet_id }
 
-  name_prefix           = var.nat_instance_name_prefix
+  name_prefix           = "${var.nat_instance_name_prefix}${each.key}-"
   max_size              = 1
   min_size              = 1
   max_instance_lifetime = var.max_instance_lifetime
