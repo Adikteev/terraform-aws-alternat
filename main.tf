@@ -491,6 +491,13 @@ resource "aws_iam_role_policy" "alternat_ec2" {
   role   = aws_iam_role.alternat_instance.name
 }
 
+resource "aws_iam_role_policy" "alternat_ec2_block_route_table_modifications" {
+  count  = var.block_route_table_modifications ? 1 : 0
+  name   = "alternat-block-route-table-modifications"
+  policy = data.aws_iam_policy_document.block_route_table_modifications[0].json
+  role   = aws_iam_role.alternat_instance.name
+}
+
 resource "aws_iam_role_policy" "alternat_additional_policies" {
   count = length(var.additional_instance_policies)
 

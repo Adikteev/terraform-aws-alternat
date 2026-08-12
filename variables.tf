@@ -73,6 +73,12 @@ variable "enable_nat_restore" {
   default     = false
 }
 
+variable "block_route_table_modifications" {
+  description = "When true, attach an explicit Deny for CreateRoute/ReplaceRoute/DeleteRoute on the Lambda and NAT instance IAM roles. Use temporarily to prevent Alternat from changing private route tables."
+  type        = bool
+  default     = true
+}
+
 variable "ingress_security_group_ids" {
   description = "A list of security group IDs that are allowed by the NAT instance."
   type        = list(string)
