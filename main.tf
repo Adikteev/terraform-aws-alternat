@@ -94,6 +94,15 @@ resource "aws_autoscaling_group" "nat_instance" {
   max_instance_lifetime = var.max_instance_lifetime
   vpc_zone_identifier   = [each.value]
 
+  metrics_granularity = "1Minute"
+  enabled_metrics = [
+    "GroupMinSize",
+    "GroupMaxSize",
+    "GroupDesiredCapacity",
+    "GroupInServiceInstances",
+    "GroupTotalInstances",
+  ]
+
   launch_template {
     id      = aws_launch_template.nat_instance_template[each.key].id
     version = "$Latest"
