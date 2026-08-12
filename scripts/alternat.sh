@@ -26,6 +26,7 @@ load_config() {
    validate_var "route_table_ids_csv" "$route_table_ids_csv"
    validate_var "enable_nat_restore" "$enable_nat_restore"
    validate_var "enable_ssm" "$enable_ssm"
+   validate_var "enable_cloudwatch_agent" "$enable_cloudwatch_agent"
 }
 
 validate_var() {
@@ -132,6 +133,44 @@ install_ssm_agent() {
    systemctl enable --now amazon-ssm-agent || panic "Unable to enable amazon-ssm-agent"
    rm -f "$tmp_deb"
    echo "SSM agent installed successfully"
+}
+
+# install_cloudwatch_agent() installs amazon-cloudwatch-agent from the official Debian package
+# when enable_cloudwatch_agent=true. Config is applied later by cwagent.json.tftpl userdata.
+# https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/download-CloudWatch-Agent-on-EC2-Instance-first-time-linux.html
+install_cloudwatch_agent() {
+   if [ "$enable_cloudwatch_agent" != "true" ]; then
+      echo "CloudWatch agent install skipped (enable_cloudwatch_agent=${enable_cloudwatch_agent})"
+      return 0
+   fi
+
+   if systemctl is-active --quiet amazon-cloudwatch-agent 2>/dev/null \
+      || [ -x /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+      echo "CloudWatch agent already installed"
+      systemctl enable --now amazon-cloudwatch-agent 2>/dev/null || true
+      return 0
+   fi
+
+   echo "Installing Amazon CloudWatch agent"
+   export DEBIAN_FRONTEND=noninteractive
+
+   local arch deb_arch
+   arch="$(uname -m)"
+   case "$arch" in
+      aarch64|arm64) deb_arch="arm64" ;;
+      x86_64|amd64) deb_arch="amd64" ;;
+      *) panic "Unsupported architecture for CloudWatch agent: ${arch}" ;;
+   esac
+
+   local tmp_deb="/tmp/amazon-cloudwatch-agent.deb"
+   local package_url="https://amazoncloudwatch-agent.s3.amazonaws.com/debian/${deb_arch}/latest/amazon-cloudwatch-agent.deb"
+
+   curl -fsSL "$package_url" -o "$tmp_deb" || panic "Unable to download amazon-cloudwatch-agent.deb"
+   dpkg -i "$tmp_deb" || apt-get install -y -qq -f || panic "Unable to install amazon-cloudwatch-agent"
+   systemctl enable amazon-cloudwatch-agent || panic "Unable to enable amazon-cloudwatch-agent"
+   # Config + restart come from the cwagent.json.tftpl cloud-init part that runs after this script.
+   rm -f "$tmp_deb"
+   echo "CloudWatch agent installed successfully"
 }
 
 # Disabling source/dest check is what makes a NAT instance a NAT instance.
@@ -293,6 +332,7 @@ load_config
 echo "Beginning self-managed NAT configuration (ak-debian-13-base / nftables)"
 configure_nat
 install_ssm_agent
+install_cloudwatch_agent
 disable_source_dest_check
 associate_eip
 configure_route_table
