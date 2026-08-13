@@ -236,6 +236,30 @@ def test_connectivity_test_handler(mock_urlopen, mock_sleep, monkeypatch):
     verify_nat_gateway_route(mocked_networking)
 
 
+@mock_aws
+@mock.patch('time.sleep')
+@mock.patch('urllib.request.urlopen')
+@mock.patch('app.are_any_routes_pointing_to_nat_gateway', return_value=True)
+def test_connectivity_test_handler_already_on_nat_gateway(mock_on_ngw, mock_urlopen, mock_sleep, monkeypatch):
+    from app import connectivity_test_handler
+
+    script_dir = os.path.dirname(__file__)
+    with open(os.path.join(script_dir, "../cloudwatch-event.json"), "r") as file:
+        cloudwatch_event = file.read()
+
+    class Context:
+        function_name = "alternat-connectivity-test"
+
+    monkeypatch.setenv("ROUTE_TABLE_IDS_CSV", "rtb-aaaaaaaa,rtb-bbbbbbbb")
+    monkeypatch.setenv("ENABLE_NAT_RESTORE", "false")
+
+    connectivity_test_handler(event=json.loads(cloudwatch_event), context=Context())
+
+    mock_on_ngw.assert_called_once()
+    mock_urlopen.assert_not_called()
+    mock_sleep.assert_not_called()
+
+
 def test_disable_ipv6():
     with mock.patch('socket.getaddrinfo') as mock_getaddrinfo:
         from app import disable_ipv6
@@ -314,22 +338,17 @@ def test_are_any_routes_pointing_to_nat_gateway():
 def test_run_nat_instance_diagnostics(mock_sleep):
     from app import run_nat_instance_diagnostics
 
-    # Common text fragments for building diagnostic outputs
-    nft_table_start = "nft_nat_table=table ip nat {\nchain postrouting {\ntype nat hook postrouting priority 100; policy accept;"
-    masquerade_rule = "\nip saddr 10.0.0.0/8 oifname \"eth0\" counter packets 0 bytes 0 masquerade"
-    nft_table_end = "\n}\n}\n"
-
-    # Build diagnostic outputs
-    good_nft_output = nft_table_start + masquerade_rule + nft_table_end
-    missing_masquerade_output = nft_table_start + nft_table_end
+    nft_masquerade = "nft_ruleset=table ip nat {\n\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t\tip saddr 10.0.0.0/8 oif \"ens5\" masquerade\n\t}\n}"
+    nft_no_masquerade = "nft_ruleset=table ip nat {\n\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t}\n}"
+    good_nft_output = f"ip_forward=1\n{nft_masquerade}"
 
     # Test scenarios: (description, ssm_output, source_dest_check, expected_result)
     test_cases = [
-        ("successful diagnostics", f"ip_forward=1\n{good_nft_output}", False, True),
-        ("ip_forward=0 failure", f"ip_forward=0\n{good_nft_output}", False, False),
-        ("missing masquerade rule failure", f"ip_forward=1\n{missing_masquerade_output}", False, False),
-        ("source/dest check enabled failure", f"ip_forward=1\n{good_nft_output}", True, False),
-        ("error in source/dest check", f"ip_forward=1\n{good_nft_output}", None, False),
+        ("successful diagnostics nftables", good_nft_output, False, True),
+        ("ip_forward=0 failure", f"ip_forward=0\n{nft_masquerade}", False, False),
+        ("missing masquerade rule failure", f"ip_forward=1\n{nft_no_masquerade}", False, False),
+        ("source/dest check enabled failure", good_nft_output, True, False),
+        ("error in source/dest check", good_nft_output, None, False),
     ]
 
     with mock.patch('boto3.client') as mock_boto_client:

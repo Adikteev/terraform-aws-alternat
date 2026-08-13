@@ -27,3 +27,11 @@ output "autoscaling_group_names" {
     : asg.name
   ]
 }
+
+output "autoscaling_group_names_by_az" {
+  description = "Map of AZ to NAT instance autoscaling group name."
+  value = {
+    for az, asg in aws_autoscaling_group.nat_instance
+    : az => asg.name
+  }
+}

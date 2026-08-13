@@ -2,13 +2,15 @@ name: Test
 
 on: push
 
+env:
+  AWS_DEFAULT_REGION: eu-west-1
+  AWS_REGION: eu-west-1
+
 jobs:
   lambda_tests:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    env:
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
     steps:
       - uses: actions/checkout@v4
 
@@ -20,7 +22,9 @@ jobs:
           pip install -r functions/replace-route/tests/test_requirements.txt
           python -m pytest
 
+  # Disabled: needs secrets.TERRATEST_ROLE_TO_ASSUME (OIDC) to run Terratest against AWS.
   terraform_tests:
+    if: false
     permissions:
       id-token: write
       contents: read
@@ -53,7 +57,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.TERRATEST_ROLE_TO_ASSUME }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Run tests
         run: go test -v -timeout 60m

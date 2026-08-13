@@ -5,7 +5,9 @@
 # https://alestic.com/2010/12/ec2-user-data-output/
 exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 
-shopt -s expand_aliases
+# Debian 13 (ak-debian-13-base) port of Alternat userdata:
+# https://github.com/chime/terraform-aws-alternat/blob/main/scripts/alternat.sh
+# Uses nftables + cloud_detect_lib from debian-13-base.
 
 panic() {
   [ -n "$1" ] && echo "$1"
@@ -22,6 +24,7 @@ load_config() {
    fi
    validate_var "eip_allocation_ids_csv" "$eip_allocation_ids_csv"
    validate_var "route_table_ids_csv" "$route_table_ids_csv"
+   validate_var "enable_nat_restore" "$enable_nat_restore"
    validate_var "enable_ssm" "$enable_ssm"
    validate_var "enable_cloudwatch_agent" "$enable_cloudwatch_agent"
 }
@@ -38,40 +41,49 @@ validate_var() {
 # configure_nat() sets up Linux to act as a NAT device.
 # See https://docs.aws.amazon.com/vpc/latest/userguide/VPC_NAT_Instance.html#NATInstance
 configure_nat() {
-   $dnf_cmd install nftables
-   systemctl enable --now nftables
+   echo "Installing NAT dependencies if needed"
+   export DEBIAN_FRONTEND=noninteractive
+   apt-get update -qq
+   apt-get install -y -qq nftables procps || panic "Unable to install nftables"
+   command -v aws >/dev/null 2>&1 || panic "aws CLI not found on PATH (expected in ak-debian-13-base)"
 
-   local nic_name="$(ip route show | grep default | sed -n 's/.*dev \([^\ ]*\).*/\1/p')"
+   systemctl enable --now nftables || panic "Unable to enable nftables"
+
+   [ -n "${MAC:-}" ] || panic "MAC missing from cloud_detect_lib"
+   echo "Found MAC ${MAC}"
+
+   local nic_name
+   nic_name="$(ip -o link | awk -v mac="${MAC}" 'BEGIN{IGNORECASE=1} index($0, mac){gsub(/:/,"",$2); print $2; exit}')"
+   if [ -z "${nic_name}" ]; then
+      nic_name="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+   fi
+   [ -n "${nic_name}" ] || panic "Unable to resolve NAT interface name"
    echo "Found interface name ${nic_name}"
 
-   echo "Determining the MAC address on ${nic_name}"
-   local nic_mac="$(cat /sys/class/net/${nic_name}/address)" || panic "Unable to determine MAC address on ${nic_name}."
-   echo "Found MAC ${nic_mac} for ${nic_name}."
-
-   local vpc_cidr_uri="http://169.254.169.254/latest/meta-data/network/interfaces/macs/${nic_mac}/vpc-ipv4-cidr-blocks"
-   echo "Metadata location for vpc ipv4 ranges: $vpc_cidr_uri"
-
-   readarray -t vpc_cidrs <<< $(CURL_WITH_TOKEN "$vpc_cidr_uri")
-   if [ ${#vpc_cidrs[*]} -lt 1 ]; then
-      panic "Unable to obtain VPC CIDR range from metadata."
-   else
-      echo "Retrieved VPC CIDR range(s) ${vpc_cidrs[@]} from metadata."
+   local vpc_cidrs=()
+   mapfile -t vpc_cidrs <<< "${VPC_IPV4_CIDR_BLOCKS:-}"
+   if [ ${#vpc_cidrs[@]} -lt 1 ] || [ -z "${vpc_cidrs[0]:-}" ]; then
+      panic "Unable to obtain VPC CIDR range from cloud_detect_lib (VPC_IPV4_CIDR_BLOCKS)."
    fi
+   echo "Retrieved VPC CIDR range(s) ${vpc_cidrs[*]} from metadata."
 
    echo "Enabling NAT..."
    # Read more about these settings here: https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt
+   sysctl -q -w "net.ipv4.ip_forward"=1 \
+      "net.ipv4.conf.${nic_name}.send_redirects"=0 \
+      "net.ipv4.ip_local_port_range"="1024 65535" || panic "sysctl NAT settings failed"
 
-   sysctl -q -w "net.ipv4.ip_forward"=1 "net.ipv4.conf.$nic_name.send_redirects"=0 "net.ipv4.ip_local_port_range"="1024 65535" ||
-      panic
-
+   # Idempotent: flush any previous alterNAT nat table, then recreate.
+   nft delete table ip nat 2>/dev/null || true
    nft add table ip nat
-   nft add chain ip nat postrouting { type nat hook postrouting priority 100 \; }
+   nft add chain ip nat postrouting '{ type nat hook postrouting priority 100 ; }'
 
-   for cidr in "${vpc_cidrs[@]}";
-   do
+   local cidr
+   for cidr in "${vpc_cidrs[@]}"; do
+      [ -n "$cidr" ] || continue
       nft add rule ip nat postrouting ip saddr "$cidr" oif "$nic_name" masquerade
       if [ $? -ne 0 ]; then
-         panic "Unable to add nft rule for cidr $cidr. nft exited with status $?"
+         panic "Unable to add nft rule for cidr $cidr"
       fi
    done
 
@@ -81,11 +93,88 @@ configure_nat() {
    echo "NAT configuration complete"
 }
 
+# install_ssm_agent() installs amazon-ssm-agent from the official Debian package when enable_ssm=true.
+# https://docs.aws.amazon.com/systems-manager/latest/userguide/agent-install-deb.html
+install_ssm_agent() {
+   if [ "$enable_ssm" != "true" ]; then
+      echo "SSM agent install skipped (enable_ssm=${enable_ssm})"
+      return 0
+   fi
+
+   if systemctl is-active --quiet amazon-ssm-agent 2>/dev/null; then
+      echo "SSM agent already running"
+      return 0
+   fi
+
+   echo "Installing Amazon SSM agent"
+   export DEBIAN_FRONTEND=noninteractive
+
+   local arch deb_arch
+   arch="$(uname -m)"
+   case "$arch" in
+      aarch64|arm64) deb_arch="debian_arm64" ;;
+      x86_64|amd64) deb_arch="debian_amd64" ;;
+      *) panic "Unsupported architecture for SSM agent: ${arch}" ;;
+   esac
+
+   local tmp_deb="/tmp/amazon-ssm-agent.deb"
+   local regional_url="https://s3.${REGION}.amazonaws.com/amazon-ssm-${REGION}/latest/${deb_arch}/amazon-ssm-agent.deb"
+   local global_url="https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/${deb_arch}/amazon-ssm-agent.deb"
+
+   if ! curl -fsSL "$regional_url" -o "$tmp_deb"; then
+      echo "Regional SSM package download failed, trying global URL"
+      curl -fsSL "$global_url" -o "$tmp_deb" || panic "Unable to download amazon-ssm-agent.deb"
+   fi
+
+   dpkg -i "$tmp_deb" || apt-get install -y -qq -f || panic "Unable to install amazon-ssm-agent"
+   systemctl enable --now amazon-ssm-agent || panic "Unable to enable amazon-ssm-agent"
+   rm -f "$tmp_deb"
+   echo "SSM agent installed successfully"
+}
+
+# install_cloudwatch_agent() installs amazon-cloudwatch-agent from the official Debian package
+# when enable_cloudwatch_agent=true. Config is applied later by cwagent.json.tftpl userdata.
+# https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/download-CloudWatch-Agent-on-EC2-Instance-first-time-linux.html
+install_cloudwatch_agent() {
+   if [ "$enable_cloudwatch_agent" != "true" ]; then
+      echo "CloudWatch agent install skipped (enable_cloudwatch_agent=${enable_cloudwatch_agent})"
+      return 0
+   fi
+
+   if systemctl is-active --quiet amazon-cloudwatch-agent 2>/dev/null \
+      || [ -x /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+      echo "CloudWatch agent already installed"
+      systemctl enable --now amazon-cloudwatch-agent 2>/dev/null || true
+      return 0
+   fi
+
+   echo "Installing Amazon CloudWatch agent"
+   export DEBIAN_FRONTEND=noninteractive
+
+   local arch deb_arch
+   arch="$(uname -m)"
+   case "$arch" in
+      aarch64|arm64) deb_arch="arm64" ;;
+      x86_64|amd64) deb_arch="amd64" ;;
+      *) panic "Unsupported architecture for CloudWatch agent: ${arch}" ;;
+   esac
+
+   local tmp_deb="/tmp/amazon-cloudwatch-agent.deb"
+   local package_url="https://amazoncloudwatch-agent.s3.amazonaws.com/debian/${deb_arch}/latest/amazon-cloudwatch-agent.deb"
+
+   curl -fsSL "$package_url" -o "$tmp_deb" || panic "Unable to download amazon-cloudwatch-agent.deb"
+   dpkg -i "$tmp_deb" || apt-get install -y -qq -f || panic "Unable to install amazon-cloudwatch-agent"
+   systemctl enable amazon-cloudwatch-agent || panic "Unable to enable amazon-cloudwatch-agent"
+   # Config + restart come from the cwagent.json.tftpl cloud-init part that runs after this script.
+   rm -f "$tmp_deb"
+   echo "CloudWatch agent installed successfully"
+}
+
 # Disabling source/dest check is what makes a NAT instance a NAT instance.
 # See https://docs.aws.amazon.com/vpc/latest/userguide/VPC_NAT_Instance.html#EIP_Disable_SrcDestCheck
 disable_source_dest_check() {
    echo "Disabling source/destination check"
-   aws ec2 modify-instance-attribute --instance-id $INSTANCE_ID --source-dest-check "{\"Value\": false}"
+   aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --source-dest-check "{\"Value\": false}"
    if [ $? -ne 0 ]; then
       panic "Unable to disable source/dest check."
    fi
@@ -96,7 +185,6 @@ disable_source_dest_check() {
 function associate_eip() {
    echo "Associating an EIP from the pool of addresses"
 
-   local associated_allocation_id=""
    local eip=""
    local num_retries=10
    local sleep_len=60
@@ -108,7 +196,7 @@ function associate_eip() {
    for n in $(seq 1 "$num_retries"); do
       for eip_allocation_id in "${eip_allocation_ids[@]}"
       do
-         eip=$(aws ec2 describe-addresses --allocation-ids "$eip_allocation_id" --query 'Addresses[0].PublicIp' | tr -d '"')
+         eip=$(aws ec2 describe-addresses --allocation-ids "$eip_allocation_id" --query 'Addresses[0].PublicIp' --output text)
          echo "Trying IP $eip"
          aws ec2 associate-address --no-allow-reassociation --allocation-id "$eip_allocation_id" --instance-id "$INSTANCE_ID"
          if [ $? -eq 0 ]; then
@@ -117,7 +205,7 @@ function associate_eip() {
          echo "Failed to associate IP $eip"
          eip=""
       done
-      if [ ! -z "$eip" ]; then
+      if [ -n "$eip" ]; then
          break
       else
          echo "Unable to associate an EIP ($n of $num_retries attempts)."
@@ -129,66 +217,54 @@ function associate_eip() {
       panic "Unable to associate an EIP!"
    fi
 
-   echo "Associated EIP $eip with instance $INSTANCE_ID";
+   echo "Associated EIP $eip with instance $INSTANCE_ID"
 }
 
-# First try to replace an existing route
-# If no route exists already (e.g. first time set up) then create the route.
+# When 0.0.0.0/0 exists: skip if enable_nat_restore=false, else replace-route.
+# When 0.0.0.0/0 is missing: create-route.
 configure_route_table() {
-   echo "Configuring route tables"
+   echo "Configuring route tables (enable_nat_restore=${enable_nat_restore})"
 
    IFS=',' read -r -a route_table_ids <<< "${route_table_ids_csv}"
 
    for route_table_id in "${route_table_ids[@]}"
    do
       echo "Attempting to find route table $route_table_id"
-      local rtb_id=$(aws ec2 describe-route-tables --filters Name=route-table-id,Values=${route_table_id} --query 'RouteTables[0].RouteTableId' | tr -d '"')
-      if [ -z "$rtb_id" ]; then
-         panic "Unable to find route table $rtb_id"
+      local rtb_id
+      rtb_id=$(aws ec2 describe-route-tables --filters Name=route-table-id,Values="${route_table_id}" --query 'RouteTables[0].RouteTableId' --output text)
+      if [ -z "$rtb_id" ] || [ "$rtb_id" = "None" ]; then
+         panic "Unable to find route table $route_table_id"
       fi
 
       echo "Found route table $rtb_id"
-      echo "Replacing route to 0.0.0.0/0 for $rtb_id"
-      aws ec2 replace-route --route-table-id "$rtb_id" --instance-id "$INSTANCE_ID" --destination-cidr-block 0.0.0.0/0
-      if [ $? -eq 0 ]; then
-         echo "Successfully replaced route to 0.0.0.0/0 via instance $INSTANCE_ID for route table $rtb_id"
-         continue
-      fi
 
-      echo "Unable to replace route. Attempting to create route"
-      aws ec2 create-route --route-table-id "$rtb_id" --instance-id "$INSTANCE_ID" --destination-cidr-block 0.0.0.0/0
-      if [ $? -eq 0 ]; then
-         echo "Successfully created route to 0.0.0.0/0 via instance $INSTANCE_ID for route table $rtb_id"
+      local existing_target
+      existing_target=$(aws ec2 describe-route-tables \
+        --route-table-ids "$rtb_id" \
+        --query 'RouteTables[0].Routes[?DestinationCidrBlock==`0.0.0.0/0`].[NatGatewayId,InstanceId,GatewayId,NetworkInterfaceId] | [0]' \
+        --output text)
+
+      if [ -n "$existing_target" ] && [ "$existing_target" != "None" ]; then
+         if [ "$enable_nat_restore" = "false" ]; then
+            echo "Default route 0.0.0.0/0 already exists on $rtb_id (target: $existing_target); skipping (enable_nat_restore=false)"
+            continue
+         fi
+
+         echo "Replacing route to 0.0.0.0/0 for $rtb_id (current target: $existing_target)"
+         if aws ec2 replace-route --route-table-id "$rtb_id" --instance-id "$INSTANCE_ID" --destination-cidr-block 0.0.0.0/0; then
+            echo "Successfully replaced route to 0.0.0.0/0 via instance $INSTANCE_ID for route table $rtb_id"
+         else
+            panic "Unable to replace the route!"
+         fi
       else
-         panic "Unable to replace or create the route!"
+         echo "No default route found. Creating route to 0.0.0.0/0 via instance $INSTANCE_ID for $rtb_id"
+         if aws ec2 create-route --route-table-id "$rtb_id" --instance-id "$INSTANCE_ID" --destination-cidr-block 0.0.0.0/0; then
+            echo "Successfully created route to 0.0.0.0/0 via instance $INSTANCE_ID for route table $rtb_id"
+         else
+            panic "Unable to create the route!"
+         fi
       fi
    done
-}
-
-# install_ssm_agent() installs the SSM agent if enable_ssm is true.
-install_ssm_agent() {
-   if [ "$enable_ssm" = "true" ]; then
-      echo "Installing SSM agent"
-      $dnf_cmd install amazon-ssm-agent && \
-      systemctl enable --now amazon-ssm-agent
-      if [ $? -ne 0 ]; then
-         panic "Unable to install SSM agent"
-      fi
-      echo "SSM agent installed successfully"
-   fi
-}
-
-# install_cloudwatch_agent() installs the CloudWatch Agent if enable_cloudwatch_agent is true.
-install_cloudwatch_agent() {
-   if [ "$enable_cloudwatch_agent" = "true" ]; then
-      echo "Installing CloudWatch agent"
-      $dnf_cmd install amazon-cloudwatch-agent && \
-      systemctl enable --now amazon-cloudwatch-agent
-      if [ $? -ne 0 ]; then
-         panic "Unable to install CloudWatch Agent"
-      fi
-      echo "CloudWatch Agent installed successfully"
-   fi
 }
 
 ASG_LIFECYCLE_HOOK_NAME="NATInstanceLaunchScript"
@@ -197,16 +273,14 @@ complete_asg_lifecycle_action() {
     echo "No lifecycle action result given"
   fi
 
-  local auto_scaling_group_name
-  auto_scaling_group_name="$(ec2-metadata --quiet --tags | grep 'aws:autoscaling:groupName' | awk '{print $2}')"
-  if [[ -z "${auto_scaling_group_name}" ]]; then
-    echo "Could not detect auto scaling group name"
+  if [[ -z "${ASG_NAME:-}" ]]; then
+    echo "Could not detect auto scaling group name (ASG_NAME from cloud_detect_lib)"
   fi
 
   local output status
   output="$(aws autoscaling complete-lifecycle-action \
     --lifecycle-hook-name "${ASG_LIFECYCLE_HOOK_NAME}" \
-    --auto-scaling-group-name "${auto_scaling_group_name}" \
+    --auto-scaling-group-name "${ASG_NAME}" \
     --lifecycle-action-result "$1" \
     --instance-id "${INSTANCE_ID}" 2>&1)"
   status=$?
@@ -222,37 +296,30 @@ complete_asg_lifecycle_action() {
   echo "Completed ASG lifecycle action with result $1"
 }
 
-curl_cmd="curl --silent --fail"
-dnf_cmd="dnf --quiet --assumeyes"
+# debian-13-base: /opt/scripts/cloud_detect_lib.sh
+# Provides INSTANCE_ID, REGION, AZ, MAC, VPC_IPV4_CIDR_BLOCKS, ASG_NAME, ...
+# shellcheck source=/dev/null
+source /opt/scripts/cloud_detect_lib.sh
+# cloud_detect_lib enables set -euo pipefail; Alternat helpers rely on explicit $? checks.
+set +e
+set +u
 
-echo "Requesting IMDSv2 token"
-token=$($curl_cmd -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 900")
-alias CURL_WITH_TOKEN="$curl_cmd -H \"X-aws-ec2-metadata-token: $token\""
+[ -n "${INSTANCE_ID:-}" ] || panic "INSTANCE_ID missing from cloud_detect_lib"
 
-# Set CLI Output to text
 export AWS_DEFAULT_OUTPUT="text"
-
-# Disable pager output
 # https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-pagination.html#cli-usage-pagination-clientside
 export AWS_PAGER=""
+export AWS_DEFAULT_REGION="${REGION}"
 
-# Set Instance Identity URI
-II_URI="http://169.254.169.254/latest/dynamic/instance-identity/document"
+echo "Running on instance ${INSTANCE_ID} az=${AZ} region=${REGION}"
 
-# Retrieve the instance ID
-INSTANCE_ID=$(CURL_WITH_TOKEN $II_URI | grep instanceId | awk -F\" '{print $4}')
-
-# Set region of NAT instance
-export AWS_DEFAULT_REGION=$(CURL_WITH_TOKEN $II_URI | grep region | awk -F\" '{print $4}')
-
-# alterNAT config file containing inputs needed for initialization
 CONFIG_FILE="/etc/alternat.conf"
 load_config
 
-echo "Beginning self-managed NAT configuration"
+echo "Beginning self-managed NAT configuration (ak-debian-13-base / nftables)"
+configure_nat
 install_ssm_agent
 install_cloudwatch_agent
-configure_nat
 disable_source_dest_check
 associate_eip
 configure_route_table

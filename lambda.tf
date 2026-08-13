@@ -121,6 +121,31 @@ resource "aws_iam_role_policy" "alternat_lambda_permissions" {
   role   = aws_iam_role.nat_lambda_role.name
 }
 
+data "aws_iam_policy_document" "block_route_table_modifications" {
+  count = var.block_route_table_modifications ? 1 : 0
+
+  statement {
+    sid    = "TempBlockAlternatRouteEdits"
+    effect = "Deny"
+    actions = [
+      "ec2:CreateRoute",
+      "ec2:ReplaceRoute",
+      "ec2:DeleteRoute",
+    ]
+    resources = [
+      for route_table in local.all_route_tables
+      : "arn:aws:ec2:${data.aws_region.current.id}:${data.aws_caller_identity.current.id}:route-table/${route_table}"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "alternat_lambda_block_route_table_modifications" {
+  count  = var.block_route_table_modifications ? 1 : 0
+  name   = "alternat-block-route-table-modifications"
+  policy = data.aws_iam_policy_document.block_route_table_modifications[0].json
+  role   = aws_iam_role.nat_lambda_role.name
+}
+
 resource "aws_lambda_permission" "sns_topic_to_alternat_lambda" {
   statement_id  = "AllowExecutionFromSNS"
   action        = "lambda:InvokeFunction"

@@ -144,7 +144,7 @@ def replace_route(route_table_id, target_id):
 def run_nat_instance_diagnostics(instance_id):
     """
     Runs a basic diagnostic script via SSM on the NAT instance.
-    It checks if IP forwarding is enabled and lists the nftables NAT configuration.
+    Checks IP forwarding and an nftables masquerade SNAT rule (ak-debian-13-base).
     Returns True if configuration is healthy, False otherwise.
     """
     ssm_client = boto3.client("ssm")
@@ -153,7 +153,7 @@ def run_nat_instance_diagnostics(instance_id):
         "#!/bin/bash",
         "set -e",
         "echo 'ip_forward='$(cat /proc/sys/net/ipv4/ip_forward)",
-        "echo 'nft_nat_table='$(nft list table ip nat 2>/dev/null || echo 'nftables nat table not found')"
+        "echo 'nft_ruleset='$(nft list ruleset 2>/dev/null || echo 'nft ruleset not found')",
     ]
 
     try:
@@ -177,13 +177,13 @@ def run_nat_instance_diagnostics(instance_id):
         if invocation.get('StandardErrorContent'):
             logger.warning("NAT instance diagnostic errors:\n%s", invocation['StandardErrorContent'])
 
-        # Check conditions
         if "ip_forward=0" in output:
             logger.warning("NAT instance has ip_forward=0 — IP forwarding is disabled.")
             return False
 
-        if "masquerade" not in output:
-            logger.warning("NAT instance nftables missing 'masquerade' rule — SNAT may be broken.")
+        # nft list ruleset prints "masquerade"
+        if "masquerade" not in output.lower():
+            logger.warning("NAT instance nftables missing masquerade rule — SNAT may be broken.")
             return False
 
         if is_source_dest_check_enabled(instance_id) is True:
@@ -298,9 +298,17 @@ def check_connection(check_urls):
         raise MissingEnvironmentVariableError("ROUTE_TABLE_IDS_CSV")
 
     restore_enabled = get_env_bool("ENABLE_NAT_RESTORE", DEFAULT_ENABLE_NAT_RESTORE)
+    already_on_nat_gateway = are_any_routes_pointing_to_nat_gateway(route_tables)
+
+    # Already failed over to NAT Gateway and automatic restore is disabled: success, nothing to do.
+    if not restore_enabled and already_on_nat_gateway:
+        logger.info(
+            "Already on NAT Gateway and ENABLE_NAT_RESTORE=false; skipping connectivity checks. Exiting successfully."
+        )
+        return True
 
     # Step 1: Try failback to NAT instance if allowed and current route is NAT Gateway
-    if restore_enabled and are_any_routes_pointing_to_nat_gateway(route_tables):
+    if restore_enabled and already_on_nat_gateway:
         logger.info("ENABLE_NAT_RESTORE=true and route is NAT Gateway. Trying to restore NAT instance...")
         attempt_nat_instance_restore()
         time.sleep(5)
@@ -358,6 +366,18 @@ def connectivity_test_handler(event, context):
         raise UnknownEventTypeError
 
     logger.debug("Starting NAT instance connectivity test")
+
+    route_tables = [rtb for rtb in os.getenv("ROUTE_TABLE_IDS_CSV", "").split(",") if rtb]
+    restore_enabled = get_env_bool("ENABLE_NAT_RESTORE", DEFAULT_ENABLE_NAT_RESTORE)
+    if (
+        not restore_enabled
+        and route_tables
+        and are_any_routes_pointing_to_nat_gateway(route_tables)
+    ):
+        logger.info(
+            "Already on NAT Gateway and ENABLE_NAT_RESTORE=false; nothing to do. Exiting successfully."
+        )
+        return
 
     check_interval = int(os.getenv("CONNECTIVITY_CHECK_INTERVAL", DEFAULT_CONNECTIVITY_CHECK_INTERVAL))
     check_urls = "CHECK_URLS" in os.environ and os.getenv("CHECK_URLS").split(",") or DEFAULT_CHECK_URLS

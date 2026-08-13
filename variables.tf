@@ -73,6 +73,12 @@ variable "enable_nat_restore" {
   default     = false
 }
 
+variable "block_route_table_modifications" {
+  description = "When true, attach an explicit Deny for CreateRoute/ReplaceRoute/DeleteRoute on the Lambda and NAT instance IAM roles. Use temporarily to prevent Alternat from changing private route tables."
+  type        = bool
+  default     = true
+}
+
 variable "ingress_security_group_ids" {
   description = "A list of security group IDs that are allowed by the NAT instance."
   type        = list(string)
@@ -81,6 +87,12 @@ variable "ingress_security_group_ids" {
 
 variable "ingress_security_group_cidr_blocks" {
   description = "A list of CIDR blocks that are allowed by the NAT instance."
+  type        = list(string)
+  default     = []
+}
+
+variable "vpn_cidr_blocks" {
+  description = "CIDR blocks for VPN ingress to the NAT instance security group (all protocols)."
   type        = list(string)
   default     = []
 }
@@ -140,7 +152,7 @@ variable "nat_instance_lifecycle_hook_role_name" {
 }
 
 variable "nat_instance_name_prefix" {
-  description = "Prefix for the NAT Auto Scaling Group and instance names. Because there is an instance created in each ASG, the name will be suffixed with an index."
+  description = "Prefix for the NAT Auto Scaling Group and instance names. ASG names become <prefix><az>-<random> (e.g. alternat-ap-southeast-1a-xxxxxx)."
   type        = string
   default     = "alternat-"
 }

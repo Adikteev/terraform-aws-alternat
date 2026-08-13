@@ -88,11 +88,20 @@ resource "aws_sns_topic" "alternat_topic" {
 resource "aws_autoscaling_group" "nat_instance" {
   for_each = { for obj in var.vpc_az_maps : obj.az => obj.public_subnet_id }
 
-  name_prefix           = var.nat_instance_name_prefix
+  name_prefix           = "${var.nat_instance_name_prefix}${each.key}-"
   max_size              = 1
   min_size              = 1
   max_instance_lifetime = var.max_instance_lifetime
   vpc_zone_identifier   = [each.value]
+
+  metrics_granularity = "1Minute"
+  enabled_metrics = [
+    "GroupMinSize",
+    "GroupMaxSize",
+    "GroupDesiredCapacity",
+    "GroupInServiceInstances",
+    "GroupTotalInstances",
+  ]
 
   launch_template {
     id      = aws_launch_template.nat_instance_template[each.key].id
@@ -117,8 +126,10 @@ resource "aws_autoscaling_group" "nat_instance" {
   dynamic "tag" {
     for_each = merge(
       var.tags,
-      { Name = "${var.nat_instance_name_prefix}${each.key}" },
-      data.aws_default_tags.current.tags,
+      {
+        Name       = "${var.nat_instance_name_prefix}${each.key}"
+        Monitoring = "node alternat"
+      },
     )
 
     content {
@@ -201,7 +212,8 @@ data "cloudinit_config" "config" {
       eip_allocation_ids_csv  = join(",", local.nat_instance_eip_ids),
       route_table_ids_csv     = join(",", each.value),
       enable_ssm              = var.enable_ssm,
-      enable_cloudwatch_agent = var.enable_cloudwatch_agent
+      enable_cloudwatch_agent = var.enable_cloudwatch_agent,
+      enable_nat_restore      = var.enable_nat_restore
     })
   }
 
@@ -298,22 +310,34 @@ resource "aws_launch_template" "nat_instance_template" {
     security_groups             = [aws_security_group.nat_instance.id]
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name = "${var.nat_instance_name_prefix}${each.key}"
+  })
+
   tag_specifications {
     resource_type = "instance"
-
     tags = merge(var.tags, {
-      alterNATInstance = "true",
+      Name             = "${var.nat_instance_name_prefix}${each.key}"
+      alterNATInstance = "true"
     })
   }
 
   tag_specifications {
     resource_type = "volume"
-
     tags = merge(var.tags, {
-      alterNATInstance = "true",
+      Name             = "${var.nat_instance_name_prefix}${each.key}"
+      alterNATInstance = "true"
     })
   }
+
+  tag_specifications {
+    resource_type = "network-interface"
+    tags = merge(var.tags, {
+      Name             = "${var.nat_instance_name_prefix}${each.key}"
+      alterNATInstance = "true"
+    })
+  }
+
   user_data = data.cloudinit_config.config[each.key].rendered
 }
 
@@ -353,6 +377,18 @@ resource "aws_security_group_rule" "nat_instance_ip_range_ingress" {
   to_port           = 0
   security_group_id = aws_security_group.nat_instance.id
   cidr_blocks       = var.ingress_security_group_cidr_blocks
+}
+
+resource "aws_security_group_rule" "nat_instance_vpn_ingress" {
+  count = length(var.vpn_cidr_blocks) > 0 ? 1 : 0
+
+  description       = "Adikteev VPN"
+  type              = "ingress"
+  protocol          = "-1"
+  from_port         = 0
+  to_port           = 0
+  security_group_id = aws_security_group.nat_instance.id
+  cidr_blocks       = var.vpn_cidr_blocks
 }
 
 resource "aws_security_group_rule" "nat_instance_ipv6_range_ingress" {
@@ -479,6 +515,13 @@ resource "aws_iam_role_policy" "alternat_ec2" {
   role   = aws_iam_role.alternat_instance.name
 }
 
+resource "aws_iam_role_policy" "alternat_ec2_block_route_table_modifications" {
+  count  = var.block_route_table_modifications ? 1 : 0
+  name   = "alternat-block-route-table-modifications"
+  policy = data.aws_iam_policy_document.block_route_table_modifications[0].json
+  role   = aws_iam_role.alternat_instance.name
+}
+
 resource "aws_iam_role_policy" "alternat_additional_policies" {
   count = length(var.additional_instance_policies)
 
@@ -574,6 +617,5 @@ module "vpc_endpoints" {
   tags               = var.tags
 }
 
-data "aws_default_tags" "current" {}
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}

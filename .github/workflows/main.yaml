@@ -3,7 +3,9 @@ name: Build
 on: push
 
 jobs:
+  # Disabled: needs AWS_ROLE_TO_ASSUME / ECR secrets to push the lambda image.
   build_and_push_image:
+    if: false
     permissions:
       id-token: write
       contents: read
