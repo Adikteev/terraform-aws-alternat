@@ -45,10 +45,7 @@ configure_nat() {
    export DEBIAN_FRONTEND=noninteractive
    apt-get update -qq
    apt-get install -y -qq nftables procps || panic "Unable to install nftables"
-   if ! command -v aws >/dev/null 2>&1; then
-      apt-get install -y -qq awscli || panic "Unable to install awscli"
-   fi
-   command -v aws >/dev/null 2>&1 || panic "aws CLI not found on PATH"
+   command -v aws >/dev/null 2>&1 || panic "aws CLI not found on PATH (expected in ak-debian-13-base)"
 
    systemctl enable --now nftables || panic "Unable to enable nftables"
 
@@ -223,8 +220,8 @@ function associate_eip() {
    echo "Associated EIP $eip with instance $INSTANCE_ID"
 }
 
-# When enable_nat_restore=true: replace then create (upstream Alternat).
-# When enable_nat_restore=false: skip if 0.0.0.0/0 already exists; otherwise create.
+# When 0.0.0.0/0 exists: skip if enable_nat_restore=false, else replace-route.
+# When 0.0.0.0/0 is missing: create-route.
 configure_route_table() {
    echo "Configuring route tables (enable_nat_restore=${enable_nat_restore})"
 
@@ -241,41 +238,31 @@ configure_route_table() {
 
       echo "Found route table $rtb_id"
 
-      if [ "$enable_nat_restore" = "false" ]; then
-         local existing_target
-         existing_target=$(aws ec2 describe-route-tables \
-           --route-table-ids "$rtb_id" \
-           --query 'RouteTables[0].Routes[?DestinationCidrBlock==`0.0.0.0/0`].[NatGatewayId,InstanceId,GatewayId,NetworkInterfaceId] | [0]' \
-           --output text)
+      local existing_target
+      existing_target=$(aws ec2 describe-route-tables \
+        --route-table-ids "$rtb_id" \
+        --query 'RouteTables[0].Routes[?DestinationCidrBlock==`0.0.0.0/0`].[NatGatewayId,InstanceId,GatewayId,NetworkInterfaceId] | [0]' \
+        --output text)
 
-         if [ -n "$existing_target" ] && [ "$existing_target" != "None" ]; then
+      if [ -n "$existing_target" ] && [ "$existing_target" != "None" ]; then
+         if [ "$enable_nat_restore" = "false" ]; then
             echo "Default route 0.0.0.0/0 already exists on $rtb_id (target: $existing_target); skipping (enable_nat_restore=false)"
             continue
          fi
 
+         echo "Replacing route to 0.0.0.0/0 for $rtb_id (current target: $existing_target)"
+         if aws ec2 replace-route --route-table-id "$rtb_id" --instance-id "$INSTANCE_ID" --destination-cidr-block 0.0.0.0/0; then
+            echo "Successfully replaced route to 0.0.0.0/0 via instance $INSTANCE_ID for route table $rtb_id"
+         else
+            panic "Unable to replace the route!"
+         fi
+      else
          echo "No default route found. Creating route to 0.0.0.0/0 via instance $INSTANCE_ID for $rtb_id"
-         aws ec2 create-route --route-table-id "$rtb_id" --instance-id "$INSTANCE_ID" --destination-cidr-block 0.0.0.0/0
-         if [ $? -eq 0 ]; then
+         if aws ec2 create-route --route-table-id "$rtb_id" --instance-id "$INSTANCE_ID" --destination-cidr-block 0.0.0.0/0; then
             echo "Successfully created route to 0.0.0.0/0 via instance $INSTANCE_ID for route table $rtb_id"
          else
             panic "Unable to create the route!"
          fi
-         continue
-      fi
-
-      echo "Replacing route to 0.0.0.0/0 for $rtb_id"
-      aws ec2 replace-route --route-table-id "$rtb_id" --instance-id "$INSTANCE_ID" --destination-cidr-block 0.0.0.0/0
-      if [ $? -eq 0 ]; then
-         echo "Successfully replaced route to 0.0.0.0/0 via instance $INSTANCE_ID for route table $rtb_id"
-         continue
-      fi
-
-      echo "Unable to replace route. Attempting to create route"
-      aws ec2 create-route --route-table-id "$rtb_id" --instance-id "$INSTANCE_ID" --destination-cidr-block 0.0.0.0/0
-      if [ $? -eq 0 ]; then
-         echo "Successfully created route to 0.0.0.0/0 via instance $INSTANCE_ID for route table $rtb_id"
-      else
-         panic "Unable to replace or create the route!"
       fi
    done
 }
